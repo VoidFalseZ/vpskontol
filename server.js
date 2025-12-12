@@ -3,6 +3,10 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const { query, validationResult } = require('express-validator');
 const fs = require('fs');
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
@@ -11,10 +15,30 @@ const { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand } = 
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const app = express();
-app.use(cors());
 
-const PORT = 8000;
-const HOST = '0.0.0.0';
+// --- Server Configuration ---
+const PORT = process.env.PORT || 8000;
+const HOST = process.env.HOST || '0.0.0.0';
+const THUMBNAIL_WIDTH = process.env.THUMBNAIL_WIDTH || 320;
+const THUMBNAIL_HEIGHT = process.env.THUMBNAIL_HEIGHT || 240;
+
+// --- Security Middleware ---
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" }, // Allow cross-origin for video/thumbnails
+    contentSecurityPolicy: false // Disable CSP for video streaming
+}));
+app.use(cors());
+app.use(morgan('combined')); // HTTP request logging
+
+// --- Rate Limiting ---
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // 100 requests per windowMs
+    message: { error: 'Too many requests, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/', apiLimiter);
 
 // --- R2 Configuration ---
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || 'your-account-id';
@@ -39,12 +63,13 @@ const METADATA_FILE = path.join(CACHE_DIR, "metadata.json");
 const SERIES_METADATA_FILE = path.join(CACHE_DIR, "series_metadata.json");
 
 // --- App Version and Dialog Control Flags ---
-const LATEST_APP_VERSION = "1.0.1";
-const SHOW_UPDATE_DIALOG_COMMAND = false;
+const LATEST_APP_VERSION = process.env.APP_VERSION || "1.0.1";
+const SHOW_UPDATE_DIALOG_COMMAND = process.env.SHOW_UPDATE_DIALOG === 'true';
 
 // Ensure directories exist on startup
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 if (!fs.existsSync(THUMBNAIL_CACHE_DIR)) fs.mkdirSync(THUMBNAIL_CACHE_DIR, { recursive: true });
+
 
 // --- R2 Helper Functions ---
 
@@ -125,7 +150,7 @@ async function downloadFromR2(key, localPath) {
         const response = await s3Client.send(command);
         const stream = response.Body;
         const writeStream = fs.createWriteStream(localPath);
-        
+
         return new Promise((resolve, reject) => {
             stream.pipe(writeStream);
             writeStream.on('finish', () => resolve(true));
@@ -200,7 +225,7 @@ const generateThumbnail = (videoPath, thumbnailPath) => {
                 timestamps: ['00:00:05.000'],
                 filename: path.basename(thumbnailPath),
                 folder: path.dirname(thumbnailPath),
-                size: '320x240'
+                size: `${THUMBNAIL_WIDTH}x${THUMBNAIL_HEIGHT}`
             })
             .on('end', () => {
                 console.log(`Thumbnail generated for ${path.basename(videoPath)} at ${thumbnailPath}`);
@@ -249,13 +274,13 @@ const getVideoDetails = async (videoFile, metadata) => {
     const thumbnailFilename = `${path.parse(filename).name}.png`;
     const thumbnailCachePath = path.join(THUMBNAIL_CACHE_DIR, thumbnailFilename);
     const thumbnailR2Key = `videos/thumbnails/${thumbnailFilename}`;
-    
+
     let thumbnail_url = `/thumbnails/${thumbnailFilename}`;
 
     // Check if thumbnail exists in cache
     if (!fs.existsSync(thumbnailCachePath)) {
         console.log(`Thumbnail not in cache for ${filename}, checking R2...`);
-        
+
         // Try to get from R2 first
         const thumbnailMeta = await getR2ObjectMetadata(thumbnailR2Key);
         if (thumbnailMeta) {
@@ -266,7 +291,7 @@ const getVideoDetails = async (videoFile, metadata) => {
             // Generate thumbnail from video
             console.log(`Generating thumbnail for ${filename}...`);
             const tempVideoPath = path.join(CACHE_DIR, `temp_${filename}`);
-            
+
             try {
                 // Download video temporarily
                 await downloadFromR2(key, tempVideoPath);
@@ -274,7 +299,7 @@ const getVideoDetails = async (videoFile, metadata) => {
                 await generateThumbnail(tempVideoPath, thumbnailCachePath);
                 // Clean up temp video
                 fs.unlinkSync(tempVideoPath);
-                
+
                 // TODO: Optionally upload generated thumbnail back to R2
                 // uploadToR2(thumbnailCachePath, thumbnailR2Key);
             } catch (error) {
@@ -309,9 +334,20 @@ app.get('/api/show_update_dialog_command', (req, res) => {
     res.json({ show_dialog: SHOW_UPDATE_DIALOG_COMMAND });
 });
 
+// --- Health Check Endpoint ---
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        version: LATEST_APP_VERSION,
+        r2_bucket: R2_BUCKET_NAME
+    });
+});
+
 app.get('/', async (req, res) => {
     const videoFiles = await listR2Videos();
-    
+
     if (videoFiles.length === 0) {
         return res.status(404).send("No videos found in R2 bucket.");
     }
@@ -438,23 +474,34 @@ app.get('/api/series/:series_title', async (req, res) => {
     res.json(seriesVideosData);
 });
 
-app.get('/api/search', async (req, res) => {
-    const query = (req.query.q || '').toLowerCase();
-    const metadata = loadMetadata();
-    const videoFiles = await listR2Videos();
+app.get('/api/search',
+    query('q').optional().isString().trim().escape(),
+    async (req, res, next) => {
+        try {
+            const errors = validationResult(req);
+            if (!errors.isEmpty()) {
+                return res.status(400).json({ errors: errors.array() });
+            }
 
-    const allVideoDetails = (await Promise.all(
-        videoFiles.map(file => getVideoDetails(file, metadata))
-    )).filter(Boolean);
+            const searchQuery = (req.query.q || '').toLowerCase();
+            const metadata = loadMetadata();
+            const videoFiles = await listR2Videos();
 
-    const filteredVideos = allVideoDetails.filter(video => {
-        const searchText = `${video.filename} ${video.display_title} ${video.series_title} ${video.description}`.toLowerCase();
-        return searchText.includes(query);
+            const allVideoDetails = (await Promise.all(
+                videoFiles.map(file => getVideoDetails(file, metadata))
+            )).filter(Boolean);
+
+            const filteredVideos = allVideoDetails.filter(video => {
+                const searchText = `${video.filename} ${video.display_title} ${video.series_title} ${video.description}`.toLowerCase();
+                return searchText.includes(searchQuery);
+            });
+
+            filteredVideos.sort((a, b) => new Date(b.last_modified) - new Date(a.last_modified));
+            res.json(filteredVideos);
+        } catch (error) {
+            next(error);
+        }
     });
-
-    filteredVideos.sort((a, b) => new Date(b.last_modified) - new Date(a.last_modified));
-    res.json(filteredVideos);
-});
 
 // --- Static File Serving ---
 
@@ -522,10 +569,25 @@ app.get('/video/:filename', async (req, res) => {
     }
 });
 
+// --- Global Error Handler ---
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(err.status || 500).json({
+        error: 'Internal server error',
+        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
+// --- 404 Handler ---
+app.use((req, res) => {
+    res.status(404).json({ error: 'Not found' });
+});
+
 // --- Start Server ---
 
 app.listen(PORT, HOST, () => {
     console.log(`✅ Server is running at http://${HOST}:${PORT}`);
     console.log(`📦 R2 Bucket: ${R2_BUCKET_NAME}`);
     console.log(`🔗 R2 Endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`);
+    console.log(`🩺 Health check: http://${HOST}:${PORT}/health`);
 });
